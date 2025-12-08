@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-'''
+"""
 ################################################################################
 #                                                                              #
 # periquito                                                                    #
@@ -31,9 +31,7 @@
 # <http://www.gnu.org/licenses>.                                               #
 #                                                                              #
 ################################################################################
-'''
 
-"""
 usage:
     periquito <audio> [options]
     periquito (-h | --help)
@@ -87,7 +85,7 @@ try:
 except Exception:
     tqdm = None
 
-__version__ = "2025-12-08T1918Z"
+__version__ = "2025-12-08T1939Z"
 
 # progress bars
 
@@ -430,7 +428,7 @@ def stitch_text_words_segments(text_parts: List[str],
     return final_text, all_words, all_segments
 
 def main(argv=None) -> int:
-    args = docopt(__doc__, argv=argv, version=f"eudaimon_transcribe_audio_file {__version__}")
+    args = docopt(__doc__, argv=argv, version=f"periquito {__version__}")
 
     audio_src             = args["<audio>"]
     model_name            = args["--model"] or "nvidia/parakeet-tdt-0.6b-v2"
