@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+'''
+################################################################################
+#                                                                              #
+# periquito                                                                    #
+#                                                                              #
+################################################################################
+#                                                                              #
+# LICENCE INFORMATION                                                          #
+#                                                                              #
+# This program transcribes audio files to both plaintext and timestamped text. #
+#                                                                              #
+# copyright (C) 2025 Will Breaden Madden, wbm@protonmail.ch                    #
+#                                                                              #
+# This software is released under the terms of the GNU General Public License  #
+# version 3 (GPLv3).                                                           #
+#                                                                              #
+# This program is free software: you can redistribute it and/or modify it      #
+# under the terms of the GNU General Public License as published by the Free   #
+# Software Foundation, either version 3 of the License, or (at your option)    #
+# any later version.                                                           #
+#                                                                              #
+# This program is distributed in the hope that it will be useful, but WITHOUT  #
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or        #
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for     #
+# more details.                                                                #
+#                                                                              #
+# For a copy of the GNU General Public License, see                            #
+# <http://www.gnu.org/licenses>.                                               #
+#                                                                              #
+################################################################################
+'''
+
+"""
+usage:
+    periquito <audio> [options]
+    periquito (-h | --help)
+    periquito --version
+
+options:
+    -h, --help                 display help message
+    --version                  show version
+    --progress                 show an overall progress bar
+    --append=<text>            suffix included in output filenames; pass "" to omit
+                               [default: _proc-4ac96d03]
+    --no-timestamps            produce only plain text; skip timestamp artefacts
+    --threads=<n>              CPU threads for PyTorch; defaults to all cores
+    --engine=<name>            chunking strategy: buffered | smart | fixed
+                               [default: buffered]
+    --model=<name>             NeMo model name or path to a .nemo file
+                               [default: nvidia/parakeet-tdt-0.6b-v2]
+
+    --force-internal-buffer    force the internal buffered path; useful to see per-frame progress
+    --chunk-sec=<sec>          maximum chunk length in seconds
+                               [default: 900]
+    --speech-pad-ms=<ms>       context padding kept around each split
+                               [default: 150]
+    --min-silence-ms=<ms>      minimum silence to accept as a split when using --engine=smart
+                               [default: 300]
+    --vad-aggr=<n>             WebRTC VAD aggressiveness 0..3 for --engine=smart
+                               [default: 2]
+    --frame-sec=<s>            frame length used inside the buffered engine
+                               [default: 10]
+    --buffer-sec=<s>           total buffer window per frame (must be >= frame)
+                               [default: 12]
+"""
+
+from docopt import docopt
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import List, Tuple, Dict
+import wave
+
+import nemo.collections.asr as nemo_asr
+import numpy as np
+import soundfile as sf
+import torch
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+
+__version__ = "2025-12-08T1918Z"
+
+# progress bars
+
+class _DummyProgressBar:
+    """
+    Define a minimal alternative progress bar (if tqdm is not available).
+    """
+    def __init__(self, total=None):
+        self.total = total
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        return False
+    def update(self, n=1):
+        pass
+    def set_postfix(self, **kwargs):
+        pass
+    def close(self):
+        pass
+
+def make_progress_bar(total: float, desc: str, unit: str = "s", enabled: bool = True):
+    """
+    Create a progress bar object. If tqdm is not available, return a dummy bar.
+    """
+    if not enabled or tqdm is None:
+        return _DummyProgressBar(total=total)
+    return tqdm(total=total, desc=desc, unit=unit, smoothing=0.1, dynamic_ncols=True)
+
+# output formats
+
+def to_srt_timestamp(seconds: float) -> str:
+    """
+    Convert seconds to SRT hh:mm:ss,mmm. Clamp negative times to 0.
+    """
+    if seconds is None or seconds < 0:
+        seconds = 0.0
+    total_ms  = int(float(seconds) * 1000.0)
+    hrs, rem  = divmod(total_ms, 3600000)
+    mins, rem = divmod(rem, 60000)
+    secs, ms  = divmod(rem, 1000)
+    return f"{hrs:02d}:{mins:02d}:{secs:02d},{ms:03d}"
+
+def write_plain_text(text: str, output_path: str) -> None:
+    """
+    Write plain transcript.
+    """
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write((text or "").strip() + "\n")
+
+def write_words_json(word_stamps, output_path: str) -> None:
+    """
+    Write word-level timestamps as JSON.
+    """
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(word_stamps or [], f, ensure_ascii=False, indent=2)
+
+def write_srt(segments, output_path: str) -> None:
+    """
+    Write segment-level timestamps to SRT.
+    """
+    with open(output_path, "w", encoding="utf-8") as f:
+        idx = 1
+        for seg in segments or []:
+            seg_text = (seg.get("segment") or "").strip()
+            if not seg_text:
+                continue
+            start = to_srt_timestamp(seg.get("start", 0.0))
+            end   = to_srt_timestamp(seg.get("end", 0.0))
+            f.write(f"{idx}\n{start} --> {end}\n{seg_text}\n\n")
+            idx += 1
+
+# sound management
+
+def ensure_ffmpeg() -> None:
+    """
+    Ensure ffmpeg exists in the PATH.
+    """
+    if shutil.which("ffmpeg") is None:
+        print("FFmpeg was not found on PATH. Please install FFmpeg.", file=sys.stderr)
+        sys.exit(2)
+
+def normalise_to_pcm16_mono16k(src_path: str, working_directory: str) -> str:
+    """
+    Convert the input file to mono PCM16 16 kHz WAV at a temporary address.
+    This ensures stable VAD and ASR behaviour.
+    """
+    ensure_ffmpeg()
+    out = os.path.join(working_directory, "normalise.wav")
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-y", "-i", src_path,
+        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+        out,
+    ]
+    subprocess.run(cmd, check=True)
+    return out
+
+def audio_duration_seconds(path: str) -> float:
+    """
+    Return duration in seconds using libsndfile.
+    """
+    info = sf.info(path)
+    return float(info.frames) / float(info.samplerate)
+
+def read_pcm16_mono16k_bytes(wav_path: str) -> Tuple[bytes, int]:
+    """
+    Read mono 16 kHz PCM16 WAV and return raw bytes and sample rate.
+    """
+    with wave.open(wav_path, "rb") as w:
+        sr = w.getframerate()
+        ch = w.getnchannels()
+        sampwidth = w.getsampwidth()
+        assert sr == 16000, "Expected 16 kHz"
+        assert ch == 1, "Expected mono"
+        assert sampwidth == 2, "Expected 16-bit PCM"
+        pcm_bytes = w.readframes(w.getnframes())
+    return pcm_bytes, sr
+
+# engine for fixed chunking (a simple time-based cut)
+
+def plan_fixed_chunks(duration: float, chunk_sec: int) -> List[Tuple[float, float]]:
+    """
+    Plan non-overlapping time windows of size chunk_sec across duration.
+    """
+    n = int(math.ceil(duration / float(chunk_sec)))
+    return [(i * chunk_sec, min((i + 1) * chunk_sec, duration)) for i in range(n)]
+
+# engine for smart chunking (voice activity detection-aware, silence-first splitting)
+
+def find_silence_intervals_webrtc(wav_path: str,
+                                  min_silence_ms: int = 300,
+                                  vad_aggr: int = 2,
+                                  frame_ms: int = 30) -> List[Tuple[float, float]]:
+    """
+    Use WebRTC VAD to find silence intervals >= min_silence_ms.
+    Return a list of (start_s, end_s) for sufficiently long silence intervals.
+    """
+    try:
+        import webrtcvad
+    except Exception as e:
+        raise RuntimeError("webrtcvad is required for --engine=smart") from e
+
+    pcm, sr = read_pcm16_mono16k_bytes(wav_path)
+    vad = webrtcvad.Vad(int(vad_aggr))
+    assert frame_ms in (10, 20, 30), "WebRTC VAD supports 10/20/30 ms frames."
+
+    bytes_per_sample = 2 # PCM16
+    frame_len = int(sr * frame_ms / 1000)
+    step_bytes = frame_len * bytes_per_sample
+
+    n_frames = len(pcm) // step_bytes
+    is_speech = []
+    for i in range(n_frames):
+        start_b = i * step_bytes
+        chunk = pcm[start_b:start_b + step_bytes]
+        if len(chunk) < step_bytes:
+            break
+        is_speech.append(vad.is_speech(chunk, sr))
+
+    silences: List[Tuple[float, float]] = []
+    in_sil = False
+    sil_start = 0.0
+    for i, sp in enumerate(is_speech):
+        t0 = (i * frame_ms) / 1000.0
+        t1 = ((i + 1) * frame_ms) / 1000.0
+        if not sp:
+            if not in_sil:
+                in_sil = True
+                sil_start = t0
+        else:
+            if in_sil:
+                in_sil = False
+                if (t0 - sil_start) * 1000.0 >= min_silence_ms:
+                    silences.append((sil_start, t0))
+    if in_sil:
+        end_t = (len(is_speech) * frame_ms) / 1000.0
+        if (end_t - sil_start) * 1000.0 >= min_silence_ms:
+            silences.append((sil_start, end_t))
+    return silences
+
+def plan_smart_chunks(duration: float,
+                      silence_intervals: List[Tuple[float, float]],
+                      chunk_sec: int) -> List[Tuple[float, float]]:
+    """
+    Build chunks that respect a hard ceiling (chunk_sec) while preferring
+    to end on the last available silence <= ceiling.
+    Returns (start_s, end_s) pairs without padding applied.
+    """
+    cuts = [0.5 * (s + e) for (s, e) in silence_intervals] # midpoints as safe cut points
+    chunks: List[Tuple[float, float]] = []
+    t0 = 0.0
+    i = 0
+    while t0 < duration - 1e-6:
+        ceiling = min(t0 + chunk_sec, duration)
+        cut = None
+        while i < len(cuts) and cuts[i] <= ceiling + 1e-9:
+            if cuts[i] >= t0 + 1e-6:
+                cut = cuts[i]
+            i += 1
+        t1 = cut if (cut is not None) else ceiling
+        if t1 <= t0 + 0.5: # ensure forward progress
+            t1 = min(t0 + chunk_sec, duration)
+        chunks.append((t0, t1))
+        t0 = t1
+    return chunks
+
+# engine buffered (overlapped frames, long-form safe)
+
+def plan_overlapped_frames(duration: float,
+                           frame_sec: float,
+                           buffer_sec: float) -> List[Tuple[float, float]]:
+    """
+    Plan overlapped windows for long-form inference.
+    total_buffer (buffer_sec) must be >= frame_sec.
+    overlap is (buffer_sec - frame_sec).
+    step is (frame_sec - overlap).
+    """
+    frame = float(frame_sec)
+    total = float(buffer_sec)
+    if total < frame:
+        total = frame
+    overlap = total - frame
+    step = max(0.1, frame - overlap) # ensure progress
+    windows: List[Tuple[float, float]] = []
+    t0 = 0.0
+    while t0 < duration - 1e-6:
+        t1 = min(t0 + frame, duration)
+        windows.append((t0, t1))
+        if t1 >= duration:
+            break
+        t0 += step
+    return windows
+
+def try_nemo_buffered_helper(asr,
+                             wav_path: str,
+                             timestamps: bool,
+                             frame_sec: float,
+                             buffer_sec: float):
+    """
+    Attempt to use the NeMo internal buffered helper for TDT/RNNT models.
+    If unavailable or failing, return None and the caller should fall back.
+    """
+    try:
+        from nemo.collections.asr.parts.utils.streaming_utils import BatchedFrameASRTDT # type: ignore
+        fb = BatchedFrameASRTDT(asr_model=asr,
+                                frame_len=float(frame_sec),
+                                total_buffer=float(buffer_sec),
+                                batch_size=1,)
+        hypotheses = fb.transcribe([wav_path], timestamps=timestamps) # type: ignore[attr-defined]
+        hypothesis = hypotheses[0]
+        return _wrap_nemo_hypothesis(hypothesis, with_timestamps=timestamps)
+    except Exception as e:
+        print(f"[info] NeMo buffered helper not available or failed ({e}); "
+              f"falling back to internal overlap-and-stitch", file=sys.stderr)
+        return None
+
+# automatic speech recognition calls and stitching primitives
+
+def _wrap_nemo_hypothesis(hypothesis, with_timestamps: bool):
+    """
+    Normalise NeMo outputs into an object with .text and .timestamp.
+    """
+    class _Out:
+        pass
+
+    out = _Out()
+
+    if isinstance(hypothesis, str):
+        out.text = hypothesis
+        out.timestamp = {}
+        return out
+
+    out.text = getattr(hypothesis, "text", "") or ""
+    ts = {}
+    if with_timestamps:
+        if hasattr(hypothesis, "word_timestamps"):
+            ts["word"] = getattr(hypothesis, "word_timestamps") or []
+        if hasattr(hypothesis, "segment_timestamps"):
+            ts["segment"] = getattr(hypothesis, "segment_timestamps") or []
+    out.timestamp = ts
+    return out
+
+def transcribe_one(asr,
+                   audio_path: str,
+                   with_timestamps: bool):
+    """
+    Run Parakeet on a single audio file path and return the first normalised result.
+    """
+    if with_timestamps:
+        outs = asr.transcribe(
+            [audio_path],
+            timestamps=True,
+            return_hypotheses=True,
+        )
+        return _wrap_nemo_hypothesis(outs[0], with_timestamps=True)
+    else:
+        outs = asr.transcribe([audio_path])
+        return _wrap_nemo_hypothesis(outs[0], with_timestamps=False)
+
+def stitch_text_words_segments(text_parts: List[str],
+                               chunk_word_lists: List[List[Dict]],
+                               chunk_segment_lists: List[List[Dict]],
+                               chunk_offsets: List[float],
+                               dedupe_eps: float = 0.15):
+    """
+    Stitch lists of texts, words, and segments with time offsets.
+    A small de-duplication window prevents double-counting across
+    overlaps.
+    """
+    final_text = " ".join(p.strip() for p in text_parts if p and p.strip())
+
+    all_words:    List[Dict] = []
+    all_segments: List[Dict] = []
+    last_keep_word_end       = -1e9
+    last_keep_seg_end        = -1e9
+
+    for words, segs, offset in zip(chunk_word_lists, chunk_segment_lists, chunk_offsets):
+        if words:
+            for w in words:
+                gs = (w.get("start") or 0.0) + offset
+                ge = (w.get("end") or 0.0) + offset
+                if ge <= last_keep_word_end + dedupe_eps:
+                    continue
+                all_words.append({"word": w.get("word", ""), "start": gs, "end": ge})
+                if ge > last_keep_word_end:
+                    last_keep_word_end = ge
+        if segs:
+            for s in segs:
+                gs = (s.get("start") or 0.0) + offset
+                ge = (s.get("end") or 0.0) + offset
+                seg_text = (s.get("segment") or "").strip()
+                if not seg_text:
+                    continue
+                if ge <= last_keep_seg_end + dedupe_eps:
+                    continue
+                all_segments.append({"segment": seg_text, "start": gs, "end": ge})
+                if ge > last_keep_seg_end:
+                    last_keep_seg_end = ge
+
+    return final_text, all_words, all_segments
+
+def main(argv=None) -> int:
+    args = docopt(__doc__, argv=argv, version=f"eudaimon_transcribe_audio_file {__version__}")
+
+    audio_src             = args["<audio>"]
+    model_name            = args["--model"] or "nvidia/parakeet-tdt-0.6b-v2"
+    no_timestamps         = bool(args["--no-timestamps"])
+    engine                = (args["--engine"] or "buffered").strip().lower()
+    show_progress         = bool(args["--progress"])
+    force_internal_buffer = bool(args["--force-internal-buffer"])
+    proc_tag              = args["--append"]
+
+    if not os.path.exists(audio_src):
+        print(f"Input not found at: {audio_src}", file=sys.stderr)
+        return 1
+
+    # Configure CPU threads for PyTorch.
+    threads_opt = args["--threads"]
+    if threads_opt is None:
+        cpu_threads = max(1, os.cpu_count() or 1)
+    else:
+        try:
+            cpu_threads = max(1, int(threads_opt))
+        except ValueError:
+            print(f"Invalid --threads value: {threads_opt}", file=sys.stderr)
+            return 1
+    torch.set_num_threads(cpu_threads)
+
+    # Parse engine-specific parameters.
+    try:
+        chunk_sec  = max(30, int(args["--chunk-sec"] or "900"))
+        pad_ms     = max(0, int(args["--speech-pad-ms"] or "150"))
+        min_sil_ms = max(100, int(args["--min-silence-ms"] or "300"))
+        vad_aggr   = int(args["--vad-aggr"] or "2")
+        if vad_aggr < 0 or vad_aggr > 3:
+            raise ValueError
+        frame_sec  = max(5.0, float(args["--frame-sec"] or "10"))
+        buffer_sec = max(frame_sec, float(args["--buffer-sec"] or "12"))
+    except ValueError:
+        print("Invalid numeric value in options.", file=sys.stderr)
+        return 1
+
+    # Load model on CPU.
+    print(f"[info] Load model {model_name}")
+    asr = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name)
+    asr.to("cpu")
+    print(f"[info] Finished loading model {model_name}")
+
+    abs_in    = os.path.abspath(audio_src)
+    in_dir    = os.path.dirname(abs_in)
+    in_base   = os.path.basename(abs_in)
+    src_ext   = os.path.splitext(in_base)[1][1:].lower()
+    base_stem = os.path.splitext(in_base)[0]
+
+    # output filepaths
+    stem                 = f"{base_stem}_{src_ext}_transcript"
+    progressive_stem     = f"{base_stem}_{src_ext}_transcript_progressive"
+    txt_path             = os.path.join(in_dir, f"{stem}{proc_tag}.txt")
+    progressive_txt_path = os.path.join(in_dir, f"{progressive_stem}{proc_tag}.txt")
+    words_json           = os.path.join(in_dir, f"{stem}_words{proc_tag}.json")
+    srt_path             = os.path.join(in_dir, f"{stem}_segments{proc_tag}.srt")
+
+    with tempfile.TemporaryDirectory(prefix="parakeet_work_") as tdir:
+        # Normalise to aim for consistent behaviour.
+        wav_normalise = normalise_to_pcm16_mono16k(audio_src, tdir)
+        duration      = audio_duration_seconds(wav_normalise)
+        sr            = 16000
+
+        if engine not in {"buffered", "smart", "fixed"}:
+            print(f"Unknown --engine value: {engine}", file=sys.stderr)
+            return 1
+
+        if engine == "buffered":
+            use_ts = not no_timestamps
+
+            item = None
+            if not force_internal_buffer:
+                # NeMo helper runs as a single call; progress cannot be hooked.
+                # If overall progress is needed, advise the internal path.
+                if show_progress:
+                    print("[info] For per-frame progress with --engine=buffered, "
+                          "pass --force-internal-buffer.", file=sys.stderr)
+                item = try_nemo_buffered_helper(asr,
+                                                wav_normalise,
+                                                timestamps=use_ts,
+                                                frame_sec=frame_sec,
+                                                buffer_sec=buffer_sec)
+
+            if item is None:
+                # internal overlap-and-stitch with progress by effective coverage
+                windows = plan_overlapped_frames(duration, frame_sec, buffer_sec)
+                audio_i16 = sf.read(wav_normalise, dtype="int16", always_2d=False)[0]
+                if audio_i16.ndim > 1:
+                    audio_i16 = audio_i16[:, 0]
+
+                text_parts: List[str] = []
+                words_per_chunk: List[List[Dict]] = []
+                segs_per_chunk: List[List[Dict]] = []
+                offsets: List[float] = []
+
+                last_effective_end = 0.0 # advance progress by non-overlapped coverage
+                from contextlib import nullcontext
+                progress_bar_cm = make_progress_bar(total=duration,
+                                                    desc="Transcribing (buffered)",
+                                                    unit="s",
+                                                    enabled=show_progress)
+                with progress_bar_cm as progress_bar:
+                    for (start_s, end_s) in windows:
+                        s0 = int(round(start_s * sr))
+                        s1 = int(round(end_s * sr))
+                        chunk_arr = audio_i16[s0:s1]
+                        chunk_wav = os.path.join(tdir, f"frame_{int(start_s*1000):012d}.wav")
+                        sf.write(chunk_wav, chunk_arr, sr, subtype="PCM_16")
+
+                        item_i = transcribe_one(asr, chunk_wav, with_timestamps=use_ts)
+                        text_parts.append(getattr(item_i, "text", "") or "")
+                        if use_ts:
+                            ts = getattr(item_i, "timestamp", {}) or {}
+                            words_per_chunk.append(ts.get("word", []) or [])
+                            segs_per_chunk.append(ts.get("segment", []) or [])
+                            offsets.append(start_s)
+
+                        # Progressive transcript snapshot after this chunk
+                        progressive_text, _, _ = stitch_text_words_segments(
+                            text_parts,
+                            words_per_chunk,
+                            segs_per_chunk,
+                            offsets,
+                            dedupe_eps=0.15)
+                        write_plain_text(progressive_text, progressive_txt_path)
+
+                        # Update progress by newly covered non-overlapped time.
+                        inc = max(0.0, end_s - last_effective_end)
+                        if inc > 0 and hasattr(progress_bar, "update"):
+                            progress_bar.update(inc)
+                            last_effective_end = end_s
+
+                final_text, all_words, all_segments = stitch_text_words_segments(text_parts,
+                                                                                 words_per_chunk,
+                                                                                 segs_per_chunk,
+                                                                                 offsets,
+                                                                                 dedupe_eps=0.15)
+
+                write_plain_text(final_text, txt_path)
+                print(final_text)
+                print(f"[saved] {txt_path}")
+                if use_ts:
+                    if all_words:
+                        write_words_json(all_words, words_json)
+                        print(f"[saved] {words_json}")
+                    if all_segments:
+                        write_srt(all_segments, srt_path)
+                        print(f"[saved] {srt_path}")
+                return 0
+
+            # If NeMo helper succeeded (no granular progress)
+            text = getattr(item, "text", "") or ""
+            write_plain_text(text, txt_path)
+            write_plain_text(text, progressive_txt_path)
+            print(text)
+            print(f"[saved] {txt_path}")
+            if not no_timestamps:
+                stamps = getattr(item, "timestamp", {}) or {}
+                if "word" in stamps and stamps["word"]:
+                    write_words_json(stamps["word"], words_json)
+                    print(f"[saved] {words_json}")
+                if "segment" in stamps and stamps["segment"]:
+                    write_srt(stamps["segment"], srt_path)
+                    print(f"[saved] {srt_path}")
+            return 0
+
+        if engine == "smart":
+            silences = find_silence_intervals_webrtc(wav_path=wav_normalise,
+                                                     min_silence_ms=min_sil_ms,
+                                                     vad_aggr=vad_aggr,
+                                                     frame_ms=30)
+            plan = plan_smart_chunks(duration, silences, chunk_sec)
+        else:
+            plan = plan_fixed_chunks(duration, chunk_sec)
+
+        # For smart/fixed engines, progress is proportional to raw
+        # coverage (sum of unpadded chunk durations) so that the total
+        # equals the file length.
+        total_cover = sum((b - a) for (a, b) in plan)
+
+        pad_b = pad_ms / 1000.0
+        pad_a = pad_ms / 1000.0
+
+        audio_i16 = sf.read(wav_normalise, dtype="int16", always_2d=False)[0]
+        if audio_i16.ndim > 1:
+            audio_i16 = audio_i16[:, 0]
+
+        text_parts:      List[str]        = []
+        words_per_chunk: List[List[Dict]] = []
+        segs_per_chunk:  List[List[Dict]] = []
+        offsets:         List[float]      = []
+
+        progress_bar_cm = make_progress_bar(
+                              total=total_cover,
+                              desc=f"Transcribing ({engine})",
+                              unit="s",
+                              enabled=show_progress)
+        with progress_bar_cm as progress_bar:
+            for idx, (start_s, end_s) in enumerate(plan, start=1):
+                chunk_start = max(0.0, start_s - pad_b)
+                chunk_end   = min(duration, end_s + pad_a)
+
+                s0 = int(round(chunk_start * sr))
+                s1 = int(round(chunk_end * sr))
+                chunk_arr = audio_i16[s0:s1]
+
+                chunk_wav = os.path.join(tdir, f"chunk_{idx:06d}.wav")
+                sf.write(chunk_wav, chunk_arr, sr, subtype="PCM_16")
+
+                item_i = transcribe_one(asr, chunk_wav, with_timestamps=not no_timestamps)
+                text_parts.append(getattr(item_i, "text", "") or "")
+
+                if not no_timestamps:
+                    ts = getattr(item_i, "timestamp", {}) or {}
+                    words_per_chunk.append(ts.get("word", []) or [])
+                    segs_per_chunk.append(ts.get("segment", []) or [])
+                    offsets.append(chunk_start)
+
+                # Progressive transcript snapshot after this chunk
+                progressive_text, _, _ = stitch_text_words_segments(text_parts,
+                                                                    words_per_chunk,
+                                                                    segs_per_chunk,
+                                                                    offsets,
+                                                                    dedupe_eps=0.15)
+                write_plain_text(progressive_text, progressive_txt_path)
+
+                # Advance by unpadded coverage to avoid double-counting overlap pads.
+                if hasattr(progress_bar, "update"):
+                    progress_bar.update(end_s - start_s)
+
+        final_text, all_words, all_segments = stitch_text_words_segments(text_parts,
+                                                                         words_per_chunk,
+                                                                         segs_per_chunk,
+                                                                         offsets,
+                                                                         dedupe_eps=0.15)
+
+        write_plain_text(final_text, txt_path)
+        print(final_text)
+        print(f"[saved] {txt_path}")
+
+        if not no_timestamps:
+            if all_words:
+                write_words_json(all_words, words_json)
+                print(f"[saved] {words_json}")
+            if all_segments:
+                write_srt(all_segments, srt_path)
+                print(f"[saved] {srt_path}")
+
+        return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
