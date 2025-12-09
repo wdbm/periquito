@@ -48,7 +48,7 @@ options:
     --engine=<name>            chunking strategy: buffered | smart | fixed
                                [default: buffered]
     --model=<name>             NeMo model name or path to a .nemo file
-                               [default: nvidia/parakeet-tdt-0.6b-v2]
+                               [default: nvidia/parakeet-tdt-0.6b-v3]
 
     --force-internal-buffer    force the internal buffered path; useful to see per-frame progress
     --chunk-sec=<sec>          maximum chunk length in seconds
@@ -85,7 +85,7 @@ try:
 except Exception:
     tqdm = None
 
-__version__ = "2025-12-08T1939Z"
+__version__ = "2025-12-09T0051Z"
 
 # progress bars
 
