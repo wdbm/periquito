@@ -20,6 +20,7 @@ sudo pip3 install --no-build-isolation "nemo_toolkit[asr]>=2.2,<3"
 sudo pip3 install "nemo_toolkit[asr]>=2.2,<3"
 sudo pip3 install -U "ml_dtypes>=0.5.0"
 sudo pip3 install transformer-engine
+sudo pip3 install coverage>=7.6.1
 ```
 
 Verified functional with the following package versions on Ubuntu 24.04:
@@ -33,3 +34,4 @@ Verified functional with the following package versions on Ubuntu 24.04:
 - nemo 2.4.0
 - ml_dtypes 0.5.4
 - transformer-engine
+- coverage 7.6.1
